@@ -77,9 +77,11 @@ body::before{content:'';position:fixed;top:-50%;left:-50%;width:200%;height:200%
 .result-info{flex:1;min-width:0}
 .result-name{font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .result-status{font-size:12px;margin-top:4px}
-.result-status.success{color:var(--success)}.result-status.error{color:var(--error)}.result-status.loading{color:var(--accent3)}
+.result-status.success{color:var(--success)}.result-status.error{color:var(--error)}.result-status.loading{color:var(--accent3);animation:pulse 1.5s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.5}}
 .progress-bar{width:100%;height:4px;background:var(--border);border-radius:2px;margin-top:8px;overflow:hidden}
-.progress-fill{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2));border-radius:2px;transition:width .3s;width:0%}
+.progress-fill{height:100%;background:linear-gradient(90deg,var(--accent),var(--accent2),var(--accent3));border-radius:2px;transition:width .3s;width:0%;animation:progressAnim 2s ease-in-out infinite}
+@keyframes progressAnim{0%{width:0%;opacity:0.7}50%{width:70%;opacity:1}100%{width:100%;opacity:0.7}}
 .stats-bar{display:none;margin-top:16px;padding:12px 20px;background:rgba(37,21,53,.8);border:1px solid var(--border);
   border-radius:14px;text-align:center;font-size:13px;color:var(--text-dim)}
 .stats-bar.active{display:block}
@@ -185,6 +187,20 @@ const statsDone=document.getElementById('statsDone');
 const statsTotal=document.getElementById('statsTotal');
 const modal=document.getElementById('passwordModal');
 const pwdInput=document.getElementById('passwordInput');
+
+// Browser compatibility check
+(function(){
+  var issues=[];
+  if(!window.crypto||!crypto.subtle)issues.push('Web Crypto API');
+  if(typeof BigInt!=='function')issues.push('BigInt');
+  if(typeof TextDecoder!=='function')issues.push('TextDecoder');
+  if(typeof TextEncoder!=='function')issues.push('TextEncoder');
+  if(issues.length>0){
+    console.warn('[CSYX] 以下浏览器功能不可用: '+issues.join(', ')+' - 解密功能可能无法正常工作');
+  }else{
+    console.log('[CSYX] 浏览器兼容性检查通过');
+  }
+})();
 
 // ============================
 // Drag & Drop
@@ -422,6 +438,7 @@ var totalCount=0,doneCount=0;
 function processFiles(files){
   var fileDataList=[];
   var loaded=0;
+  var rejected=0;
   if(files.length===0)return;
 
   files.forEach(function(file){
@@ -430,9 +447,15 @@ function processFiles(files){
       var data=new Uint8Array(reader.result);
       var parsed=parseHeader(data);
       if(parsed)fileDataList.push({file:file,data:data,parsed:parsed});
+      else rejected++;
       loaded++;
       if(loaded===files.length){
-        if(fileDataList.length===0){addResult('','❌','未找到有效的加密文件','error');return;}
+        if(fileDataList.length===0){
+          var msg='未找到有效的加密文件';
+          if(rejected>0)msg+=' ('+rejected+' 个文件被跳过)';
+          addResult('', '❌', msg, 'error');
+          return;
+        }
         totalCount=fileDataList.length;doneCount=0;
         statsBar.classList.add('active');
         statsTotal.textContent=totalCount;statsDone.textContent='0';
@@ -441,6 +464,13 @@ function processFiles(files){
           pendingFiles=fileDataList;showPasswordModal();return;
         }
         decryptAll(fileDataList,currentPassword||'');
+      }
+    };
+    reader.onerror=function(){
+      loaded++;
+      rejected++;
+      if(loaded===files.length&&fileDataList.length===0){
+        addResult('','❌','读取文件失败','error');
       }
     };
     reader.readAsArrayBuffer(file);
@@ -498,19 +528,229 @@ function parseHeader(data){
 }
 
 // ============================
-// AES-256-GCM
+// AES-256-GCM (Web Crypto API + Pure-JS fallback)
 // ============================
-function deriveKey(password,salt){
-  var enc=new TextEncoder();
-  return crypto.subtle.importKey('raw',enc.encode(password),'PBKDF2',false,['deriveKey']).then(function(km){
-    return crypto.subtle.deriveKey({name:'PBKDF2',salt:salt,iterations:100000,hash:'SHA-256'},km,{name:'AES-GCM',length:256},false,['decrypt']);
-  });
+
+// Detect if Web Crypto API is available and usable
+var USE_WEB_CRYPTO=!!(window.crypto&&crypto.subtle);
+
+// --- Pure-JS SHA-256 ---
+var SHA256_K=[0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc67178f2,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+function sha256(msg){
+  var buf=msg instanceof Uint8Array?msg:new Uint8Array(msg);
+  var len=buf.length,padLen=((56-(len+1)%64)+64)%64;
+  var padded=new Uint8Array(len+padLen+8);
+  padded.set(buf);padded[len]=0x80;
+  var view=new DataView(padded.buffer);
+  view.setUint32(padded.length-4,len*8,false);
+  var h=[0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+  var w=new Uint32Array(64);
+  for(var offset=0;offset<padded.length;offset+=64){
+    for(var i=0;i<16;i++)w[i]=view.getUint32(offset+i*4);
+    for(var i=16;i<64;i++){
+      var s0=(w[i-15]>>>7)^(w[i-15]>>>18)^(w[i-15]>>>3);
+      var s1=(w[i-2]>>>17)^(w[i-2]>>>19)^(w[i-2]>>>10);
+      w[i]=(w[i-16]+s0+w[i-7]+s1)|0;
+    }
+    var a=h[0],b=h[1],c=h[2],d=h[3],e=h[4],f=h[5],g=h[6],hh=h[7];
+    for(var i=0;i<64;i++){
+      var S1=(e>>>6)^(e>>>11)^(e>>>25);
+      var ch=(e&f)^((~e)&g);
+      var temp=(hh+S1+ch+SHA256_K[i]+w[i])|0;
+      var S0=(a>>>2)^(a>>>13)^(a>>>22);
+      var maj=(a&b)^(a&c)^(b&c);
+      hh=g;g=f;f=e;e=(d+temp)|0;d=c;c=b;b=a;a=(temp+S0+maj)|0;
+    }
+    h[0]=(h[0]+a)|0;h[1]=(h[1]+b)|0;h[2]=(h[2]+c)|0;h[3]=(h[3]+d)|0;
+    h[4]=(h[4]+e)|0;h[5]=(h[5]+f)|0;h[6]=(h[6]+g)|0;h[7]=(h[7]+hh)|0;
+  }
+  var out=new Uint8Array(32);
+  var ov=new DataView(out.buffer);
+  for(var i=0;i<8;i++)ov.setUint32(i*4,h[i]);
+  return out;
 }
 
-function aesDecrypt(key,iv,ciphertext,tag){
-  var combined=new Uint8Array(ciphertext.length+tag.length);
-  combined.set(ciphertext);combined.set(tag,ciphertext.length);
-  return crypto.subtle.decrypt({name:'AES-GCM',iv:iv},key,combined).then(function(buf){return new Uint8Array(buf);});
+// --- Pure-JS HMAC-SHA256 ---
+function hmacSha256(key,msg){
+  var blockLen=64;
+  if(key.length>blockLen)key=sha256(key);
+  if(key.length<blockLen){
+    var padded=new Uint8Array(blockLen);padded.set(key);key=padded;
+  }
+  var oKey=new Uint8Array(blockLen),iKey=new Uint8Array(blockLen);
+  for(var i=0;i<blockLen;i++){oKey[i]=key[i]^0x5c;iKey[i]=key[i]^0x36;}
+  var iMsg=new Uint8Array(blockLen+msg.length);iMsg.set(iKey);iMsg.set(msg,blockLen);
+  var inner=sha256(iMsg);
+  var oMsg=new Uint8Array(blockLen+inner.length);oMsg.set(oKey);oMsg.set(inner,blockLen);
+  return sha256(oMsg);
+}
+
+// --- Pure-JS PBKDF2-HMAC-SHA256 ---
+function pbkdf2(password,salt,iterations,dkLen){
+  var passwordBytes=new Uint8Array(password.length);
+  for(var i=0;i<password.length;i++)passwordBytes[i]=password.charCodeAt(i)&0xff;
+  var hLen=32,blocks=Math.ceil(dkLen/hLen);
+  var dk=new Uint8Array(blocks*hLen);
+  var offset=0;
+  for(var i=1;i<=blocks;i++){
+    var U=hmacSha256(passwordBytes,concatBytes(salt,intToBytes(i)));
+    var T=new Uint8Array(U);
+    for(var j=2;j<=iterations;j++){
+      U=hmacSha256(passwordBytes,U);
+      for(var k=0;k<hLen;k++)T[k]^=U[k];
+    }
+    dk.set(T,offset);offset+=hLen;
+  }
+  return dk.slice(0,dkLen);
+}
+function concatBytes(a,b){var r=new Uint8Array(a.length+b.length);r.set(a);r.set(b);return r;}
+function intToBytes(n){return new Uint8Array([(n>>>24)&0xff,(n>>>16)&0xff,(n>>>8)&0xff,n&0xff]);}
+
+// --- Pure-JS AES-256 (block cipher) ---
+var AES_SBOX=[0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16];
+var AES_RCON=[0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1b,0x36];
+
+function aesExpandKey(key){
+  var Nk=8,Nr=14;
+  var w=[];
+  for(var i=0;i<Nk;i++)w.push([key[4*i],key[4*i+1],key[4*i+2],key[4*i+3]]);
+  for(var i=Nk;i<4*(Nr+1);i++){
+    var t=w[i-1].slice();
+    if(i%Nk===0){t=[AES_SBOX[t[1]],AES_SBOX[t[2]],AES_SBOX[t[3]],AES_SBOX[t[0]]];t[0]^=AES_RCON[i/Nk-1];}
+    else if(Nk>6&&i%Nk===4){t=[AES_SBOX[t[0]],AES_SBOX[t[1]],AES_SBOX[t[2]],AES_SBOX[t[3]]];}
+    w.push([w[i-Nk][0]^t[0],w[i-Nk][1]^t[1],w[i-Nk][2]^t[2],w[i-Nk][3]^t[3]]);
+  }
+  return{w:w,Nr:Nr};
+}
+
+function aesEncryptBlock(expanded,block){
+  var w=expanded.w,Nr=expanded.Nr;
+  var s=[[block[0],block[4],block[8],block[12]],[block[1],block[5],block[9],block[13]],[block[2],block[6],block[10],block[14]],[block[3],block[7],block[11],block[15]]];
+  for(var c=0;c<4;c++)for(var r=0;r<4;r++)s[r][c]^=w[c][r];
+  function mc(a0,a1,a2,a3){
+    function xt(v){return(v&0x80)?((v<<1)^0x1b)&0xff:(v<<1)&0xff;}
+    return[(xt(a0)^xt(a1)^a1^a2^a3)&0xff,(a0^xt(a1)^xt(a2)^a2^a3)&0xff,(a0^a1^xt(a2)^xt(a3)^a3)&0xff,(xt(a0)^a0^a1^a2^xt(a3))&0xff];
+  }
+  for(var rnd=1;rnd<Nr;rnd++){
+    for(var r=0;r<4;r++)for(var c=0;c<4;c++)s[r][c]=AES_SBOX[s[r][c]];
+    s[1]=[s[1][1],s[1][2],s[1][3],s[1][0]];
+    s[2]=[s[2][2],s[2][3],s[2][0],s[2][1]];
+    s[3]=[s[3][3],s[3][0],s[3][1],s[3][2]];
+    for(var c=0;c<4;c++){var m=mc(s[0][c],s[1][c],s[2][c],s[3][c]);for(var r=0;r<4;r++)s[r][c]=m[r];}
+    for(var c=0;c<4;c++){var wrd=w[rnd*4+c];for(var r=0;r<4;r++)s[r][c]^=wrd[r];}
+  }
+  for(var r=0;r<4;r++)for(var c=0;c<4;c++)s[r][c]=AES_SBOX[s[r][c]];
+  s[1]=[s[1][1],s[1][2],s[1][3],s[1][0]];
+  s[2]=[s[2][2],s[2][3],s[2][0],s[2][1]];
+  s[3]=[s[3][3],s[3][0],s[3][1],s[3][2]];
+  for(var c=0;c<4;c++){var wrd=w[Nr*4+c];for(var r=0;r<4;r++)s[r][c]^=wrd[r];}
+  var out=new Uint8Array(16);
+  for(var c=0;c<4;c++)for(var r=0;r<4;r++)out[r+4*c]=s[r][c];
+  return out;
+}
+
+// --- Pure-JS AES-GCM (uses BigInt for GF(128) multiplication)
+function gf128Mult(x,y){
+  var xi=bytesToBigInt(x),yi=bytesToBigInt(y);
+  var R=BigInt('0xe1'+'00'.repeat(15));
+  var z=BigInt(0);
+  for(var i=127;i>=0;i--){
+    if((yi>>BigInt(i))&BigInt(1))z^=xi;
+    if(xi&BigInt(1))xi=(xi>>BigInt(1))^R;
+    else xi>>=BigInt(1);
+  }
+  return bigIntToBytes(z);
+}
+function bytesToBigInt(b){var r=BigInt(0);for(var i=0;i<b.length;i++)r=(r<<BigInt(8))|BigInt(b[i]);return r;}
+function bigIntToBytes(n){var a=new Uint8Array(16);for(var i=15;i>=0;i--){a[i]=Number(n&BigInt(0xff));n>>=BigInt(8);}return a;}
+
+function ghash(H,A,C){
+  function pad16(d){var r=d.length%16;return r?concatBytes(d,new Uint8Array(16-r)):d;}
+  var padded=concatBytes(pad16(A),pad16(C));
+  // Append lengths as two 64-bit big-endian values (bit lengths)
+  var aBits=A.length*8,cBits=C.length*8;
+  var lenBytes=new Uint8Array(16);
+  for(var i=7;i>=0;i--){lenBytes[i]=aBits&0xff;aBits>>=8;}
+  for(var i=15;i>=8;i--){lenBytes[i]=cBits&0xff;cBits>>=8;}
+  var data=concatBytes(padded,lenBytes);
+  var y=new Uint8Array(16);
+  for(var i=0;i<data.length;i+=16){
+    var block=data.slice(i,i+16);
+    var xored=new Uint8Array(16);
+    for(var j=0;j<16;j++)xored[j]=y[j]^block[j];
+    y=gf128Mult(H,xored);
+  }
+  return y;
+}
+function intToBytesBE(n,len){var a=new Uint8Array(len);for(var i=len-1;i>=0;i--){a[i]=n&0xff;n>>>=8;}return a;}
+
+function gcmCtr(expanded,J0,data){
+  var counter=inc32(J0);
+  var result=new Uint8Array(data.length);
+  for(var i=0;i<data.length;i+=16){
+    var encBlock=aesEncryptBlock(expanded,counter);
+    var chunk=Math.min(16,data.length-i);
+    for(var j=0;j<chunk;j++)result[i+j]=data[i+j]^encBlock[j];
+    counter=inc32(counter);
+  }
+  return result;
+}
+function inc32(block){
+  var b=new Uint8Array(block);
+  for(var i=15;i>=12;i--){b[i]=(b[i]+1)&0xff;if(b[i]!==0)break;}
+  return b;
+}
+
+function pureAesGcmDecrypt(keyBytes,iv,ciphertext,tag){
+  var expanded=aesExpandKey(keyBytes);
+  var H=aesEncryptBlock(expanded,new Uint8Array(16));
+  var J0;
+  if(iv.length===12){J0=concatBytes(iv,new Uint8Array([0,0,0,1]));}
+  else{J0=ghash(H,new Uint8Array(0),iv);}
+  var plaintext=gcmCtr(expanded,J0,ciphertext);
+  var S=ghash(H,new Uint8Array(0),ciphertext);
+  var ej0=aesEncryptBlock(expanded,J0);
+  var expectedTag=new Uint8Array(16);
+  for(var i=0;i<16;i++)expectedTag[i]=S[i]^ej0[i];
+  var match=true;
+  for(var i=0;i<16;i++){if(expectedTag[i]!==tag[i]){match=false;break;}}
+  if(!match)throw new Error('Decryption failed: tag mismatch');
+  return plaintext;
+}
+
+// --- Key derivation and decryption ---
+function deriveKey(password,salt){
+  if(USE_WEB_CRYPTO){
+    var enc=new TextEncoder();
+    return crypto.subtle.importKey('raw',enc.encode(password),'PBKDF2',false,['deriveKey']).then(function(km){
+      return crypto.subtle.deriveKey({name:'PBKDF2',salt:salt,iterations:100000,hash:'SHA-256'},km,{name:'AES-GCM',length:256},false,['decrypt']).then(function(key){
+        return{key:key,mode:'webcrypto'};
+      });
+    }).catch(function(){
+      USE_WEB_CRYPTO=false;
+      return Promise.resolve({key:pbkdf2(password,salt,100000,32),mode:'purejs'});
+    });
+  }
+  return Promise.resolve({key:pbkdf2(password,salt,100000,32),mode:'purejs'});
+}
+
+function aesDecrypt(keyObj,iv,ciphertext,tag){
+  if(keyObj.mode==='webcrypto'){
+    var combined=new Uint8Array(ciphertext.length+tag.length);
+    combined.set(ciphertext);combined.set(tag,ciphertext.length);
+    return crypto.subtle.decrypt({name:'AES-GCM',iv:iv},keyObj.key,combined).then(function(buf){
+      return new Uint8Array(buf);
+    }).catch(function(){
+      // Extract raw key from CryptoKey and retry with pure-JS
+      return crypto.subtle.exportKey('raw',keyObj.key).then(function(raw){
+        return pureAesGcmDecrypt(new Uint8Array(raw),iv,ciphertext,tag);
+      }).catch(function(){
+        throw new Error('AES-GCM decryption failed');
+      });
+    });
+  }
+  // Pure-JS mode: key is already a Uint8Array
+  return Promise.resolve(pureAesGcmDecrypt(keyObj.key,iv,ciphertext,tag));
 }
 
 // ============================
@@ -523,8 +763,13 @@ function decryptFile(item,password,autoDownload){
   var el=addResult(file.name,emoji,'正在解密 '+typeLabel+'...','loading',true);
   var pwd=parsed.hasPassword?password:'CSYX_DEFAULT_KEY';
 
-  return deriveKey(pwd,parsed.salt).then(function(key){
-    return aesDecrypt(key,parsed.iv,parsed.ciphertext,parsed.tag);
+  // Check if Web Crypto API is available
+  if(!window.crypto||!crypto.subtle){
+    updateResult(el,'浏览器不支持 Web Crypto API，将使用备用解密方式','loading');
+  }
+
+  return deriveKey(pwd,parsed.salt).then(function(keyObj){
+    return aesDecrypt(keyObj,parsed.iv,parsed.ciphertext,parsed.tag);
   }).then(function(decrypted){
     updateResult(el,typeLabel+' 解密成功！','success',100);
     var filename=parsed.filename||('decrypted'+(CONTENT_EXT[parsed.contentType]||'.bin'));
@@ -533,7 +778,10 @@ function decryptFile(item,password,autoDownload){
     return{data:decrypted,filename:filename,mime:mime};
   }).catch(function(err){
     var msg='解密失败';
-    if(err.name==='OperationError')msg=parsed.hasPassword?'密码错误或文件已损坏':'文件已损坏';
+    if(err.message&&err.message.indexOf('tag')!==-1)msg=parsed.hasPassword?'密码错误':'文件已损坏';
+    else if(err.name==='OperationError')msg=parsed.hasPassword?'密码错误或文件已损坏':'文件已损坏';
+    else if(!window.crypto||!crypto.subtle)msg='浏览器不支持解密功能，请使用现代浏览器（Chrome/Safari/Edge）';
+    else if(err.message)msg='解密失败: '+err.message;
     updateResult(el,msg,'error',0);
     return null;
   });
